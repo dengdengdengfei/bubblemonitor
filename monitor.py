@@ -19,7 +19,7 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 try:
-    from supabase import create_client
+    from supabase import ClientOptions, create_client
 except Exception as e:  # pragma: no cover
     raise RuntimeError(
         "缺少依赖 supabase，请在 bubblecrawl 环境执行：\n"
@@ -55,13 +55,21 @@ def _resolve_path(path_value: str) -> Path:
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "a_dis")
+BUBBLE_API_KEY = os.getenv("BUBBLE_API_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError(
         "Supabase 环境变量缺失：请在 .env 中设置 SUPABASE_URL 和 SUPABASE_ANON_KEY（或 SUPABASE_SERVICE_ROLE_KEY）。"
     )
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+if not BUBBLE_API_KEY:
+    raise RuntimeError("缺少 BUBBLE_API_KEY：请在 .env 中设置，例如 BUBBLE_API_KEY=123456")
+
+supabase = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY,
+    options=ClientOptions(headers={"x-bubble-key": BUBBLE_API_KEY}),
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -100,11 +108,10 @@ def _get_item_typename(item: dict) -> str:
 
 
 def insertdata(data: dict) -> None:
-    # 使用 insert（只需要 INSERT 权限）。
-    # 注意：upsert 会走 ON CONFLICT DO UPDATE，通常还需要 UPDATE 权限，
-    # 如果你按“只放行 INSERT”的 RLS/GRANT 配置，会直接报 permission denied。
+    # insert + returning='representation'：返回插入后的行。
+    # Supabase 端用 RLS policy 校验请求头 x-bubble-key，避免对 anon 放开全表读写。
     try:
-        resp = supabase.table(SUPABASE_TABLE).insert(data).execute()
+        resp = supabase.table(SUPABASE_TABLE).insert(data, returning="representation").execute()
         resp_error = getattr(resp, "error", None)
         if resp_error:
             code = None
@@ -115,21 +122,19 @@ def insertdata(data: dict) -> None:
 
             # 23505: unique_violation（主键重复）——忽略即可
             if code == "23505":
-                print(f"已存在，跳过: id={data.get('id')}")
-                return
-
-            # 42501: insufficient_privilege
-            if code == "42501":
-                print(
-                    "写入 Supabase 失败: permission denied。\n"
-                    "请确认 Supabase 已执行 supabase_a_dis.sql（GRANT INSERT + RLS policy）。\n"
-                    "或在 .env 改用 SUPABASE_SERVICE_ROLE_KEY（不推荐公开环境）。"
+                existing = (
+                    supabase.table(SUPABASE_TABLE)
+                    .select("*")
+                    .eq("id", data.get("id"))
+                    .limit(1)
+                    .execute()
                 )
+                print(f"已存在，返回已存在行: id={data.get('id')} data={getattr(existing, 'data', None)}")
                 return
 
             print(f"写入 Supabase 失败: {resp_error}")
             return
-        print(f"写入 Supabase 成功: id={data.get('id')}")
+        print(f"写入 Supabase 成功: id={data.get('id')} data={getattr(resp, 'data', None)}")
     except Exception as err:
         print(f"写入 Supabase 失败: {err}")
 

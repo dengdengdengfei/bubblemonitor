@@ -64,12 +64,69 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-def insertdata(data: dict) -> None:
-    # 用 upsert 避免因主键 id 重复导致插入失败
+def _env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None or str(val).strip() == "":
+        return default
     try:
-        resp = supabase.table(SUPABASE_TABLE).upsert(data, on_conflict="id").execute()
+        return int(str(val).strip())
+    except ValueError:
+        return default
+
+
+LISTEN_PATH = os.getenv("LISTEN_PATH", "/messages")
+LISTEN_TIMEOUT = _env_int("LISTEN_TIMEOUT", 15)
+PAGE_WAIT_SECONDS = _env_int("PAGE_WAIT_SECONDS", 4)
+RETRIES = _env_int("RETRIES", 2)
+
+
+def _pick_first(item: dict, keys: list[str]) -> str | None:
+    for key in keys:
+        val = item.get(key)
+        if val is None:
+            continue
+        s = str(val).strip()
+        if s:
+            return s
+    return None
+
+
+def _get_item_url(item: dict) -> str | None:
+    return _pick_first(item, ["url", "URL", "网址", "链接", "link", "Link"])
+
+
+def _get_item_typename(item: dict) -> str:
+    return _pick_first(item, ["typename", "type", "分类", "类别", "name", "名称"]) or ""
+
+
+def insertdata(data: dict) -> None:
+    # 使用 insert（只需要 INSERT 权限）。
+    # 注意：upsert 会走 ON CONFLICT DO UPDATE，通常还需要 UPDATE 权限，
+    # 如果你按“只放行 INSERT”的 RLS/GRANT 配置，会直接报 permission denied。
+    try:
+        resp = supabase.table(SUPABASE_TABLE).insert(data).execute()
         resp_error = getattr(resp, "error", None)
         if resp_error:
+            code = None
+            try:
+                code = resp_error.get("code")
+            except Exception:
+                pass
+
+            # 23505: unique_violation（主键重复）——忽略即可
+            if code == "23505":
+                print(f"已存在，跳过: id={data.get('id')}")
+                return
+
+            # 42501: insufficient_privilege
+            if code == "42501":
+                print(
+                    "写入 Supabase 失败: permission denied。\n"
+                    "请确认 Supabase 已执行 supabase_a_dis.sql（GRANT INSERT + RLS policy）。\n"
+                    "或在 .env 改用 SUPABASE_SERVICE_ROLE_KEY（不推荐公开环境）。"
+                )
+                return
+
             print(f"写入 Supabase 失败: {resp_error}")
             return
         print(f"写入 Supabase 成功: id={data.get('id')}")
@@ -80,17 +137,44 @@ def insertdata(data: dict) -> None:
 def job(driver: ChromiumPage, data_list: list) -> None:
     print(f"任务执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     for item in data_list:
-        typename = item.get('typename')
-        url = item.get('url')
+        typename = _get_item_typename(item)
+        url = _get_item_url(item)
+        if not url:
+            print(f"跳过：Excel 行缺少 url 字段：{item}")
+            continue
         print(url)
-        driver.listen.start('/messages')
-        driver.get(url)
-        time.sleep(4)
         try:
-            video_resp = driver.listen.wait(timeout=10)
-            if not video_resp or isinstance(video_resp, bool):
-                print("未捕获到 /messages 响应（可能超时/未登录/无权限/页面未触发请求）")
+            # 部分版本支持 clear；有的话就清一下，避免拿到上一轮的包
+            if hasattr(driver.listen, "clear"):
+                driver.listen.clear()
+        except Exception:
+            pass
+
+        driver.listen.start(LISTEN_PATH)
+        driver.get(url)
+        time.sleep(PAGE_WAIT_SECONDS)
+        try:
+            current_url = getattr(driver, "url", "")
+            if current_url and isinstance(current_url, str) and "login" in current_url:
+                print("疑似未登录 Discord：当前页面跳转到 login，请先在浏览器里登录一次再跑脚本")
+
+            video_resp = None
+            for attempt in range(1, max(RETRIES, 1) + 1):
+                candidate = driver.listen.wait(timeout=LISTEN_TIMEOUT)
+                if candidate and not isinstance(candidate, bool):
+                    video_resp = candidate
+                    break
+                print(
+                    f"未捕获到 {LISTEN_PATH} 响应（attempt {attempt}/{RETRIES}，timeout={LISTEN_TIMEOUT}s）"
+                )
+                time.sleep(1)
+
+            if not video_resp:
+                print(
+                    "本轮无数据：可能页面未触发接口、监听路径不匹配、网络慢、或需要登录/权限。"
+                )
                 continue
+
             resdata = video_resp.response.body
             datalist = resdata
             if not isinstance(datalist, list) or len(datalist) == 0:
